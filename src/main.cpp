@@ -1,4 +1,3 @@
-
 /** SteamVR V1 HTC / SteamVR V2.0 Lighthouse/Base Station ESP32 Control:
  *
  *  Created: on March 25 2021
@@ -10,12 +9,15 @@
  */
 
 #define CONFIG_BT_NIMBLE_MAX_CONNECTIONS 5
+#define NIMBLE_MAX_CONNECTIONS CONFIG_BT_NIMBLE_MAX_CONNECTIONS
 
 #include <Arduino.h>
 #include <NimBLEDevice.h>
 #include "JC_Button.h"
 #include <WiFi.h>
 #include <WebServer.h>
+#include <PubSubClient.h>
+#include <Preferences.h>
 
 // For Version 1 (HTC) Base Stations:
 
@@ -25,8 +27,41 @@
 // before shutting down, so I personally put both in :) This is required to turn
 // the Base Station off immediately, and as such, this app is configured so if
 // you want this to even turn it ON, you need the ID in here.
-// My Base Stations for example: "7F35E5C5", "034996AB"
-const char* lighthouseHTCIDs[] = {"7F35E5C5", "034996AB"};
+// My Base Stations for example: "7F35E5C5", "034996AB"  
+// Based on your .ini file: 0x3BBF1347, 0x6BC162BD, etc.
+// Mapping: Advertised Name -> Full 8-character ID 
+struct LighthouseMapping {
+  const char* advertisedId;    // Last part of "HTC BS XXXXXX"
+  const char* fullId;          // Full 8-character ID for commands
+};
+
+const LighthouseMapping lighthouseMappings[] = {
+  {"C21347", "3BBF1347"},  // HTC BS C21347 -> 0x3BBF1347 from .ini (Master B)
+  {"F862BD", "6BC162BD"}   // HTC BS F862BD -> 0x6BC162BD from .ini (Master B)
+};
+
+// Custom names for each lighthouse (can be changed via web interface)
+String lighthouseNames[] = {"Room 1 Master (C21347)", "Room 2 Master (F862BD)"};
+
+// Helper function to get full ID from advertised ID
+const char* getFullIdFromAdvertised(const char* advertisedId) {
+  for (int i = 0; i < sizeof(lighthouseMappings) / sizeof(lighthouseMappings[0]); i++) {
+    if (strcmp(advertisedId, lighthouseMappings[i].advertisedId) == 0) {
+      return lighthouseMappings[i].fullId;
+    }
+  }
+  return nullptr;
+}
+
+// Helper function to get mapping index from advertised ID
+int getMappingIndexFromAdvertised(const char* advertisedId) {
+  for (int i = 0; i < sizeof(lighthouseMappings) / sizeof(lighthouseMappings[0]); i++) {
+    if (strcmp(advertisedId, lighthouseMappings[i].advertisedId) == 0) {
+      return i;
+    }
+  }
+  return -1;
+}
 
 // For Version 2.0 Base Stations:
 
@@ -50,20 +85,29 @@ Button offButton(32);  // define the pin for button (pull to ground to activate)
 
 Button onButton(33);  // define the pin for button (pull to ground to activate)
 
-const char* ssid = "YOUR_SSID";        // TODO: set your WiFi SSID
-const char* password = "YOUR_PASSWORD"; // TODO: set your WiFi password
+const char* ssid = "Oben";        // TODO: set your WiFi SSID
+const char* password = "06385538"; // TODO: set your WiFi password
 
 WebServer server(80);
 
+// MQTT Configuration
+WiFiClient wifiClient;
+PubSubClient mqttClient(wifiClient);
+Preferences preferences;
+
+// MQTT Settings (will be loaded from preferences)
+String mqttServer = "";
+int mqttPort = 1883;
+String mqttUsername = "";
+String mqttPassword = "";
+String mqttTopic = "lighthouse";
+bool mqttEnabled = false;
+unsigned long lastMqttReconnectAttempt = 0;
+
 // The remote service we wish to connect to.
-// static NimBLEUUID serviceUUIDHTC("0000cb00-0000-1000-8000-00805f9b34fb");
-// ^ V1 Service long UUID
-static NimBLEUUID serviceUUIDHTC("CB00");
+static NimBLEUUID serviceUUIDHTC("0000cb00-0000-1000-8000-00805f9b34fb");
 // The characteristic of the remote service we are interested in.
-// static NimBLEUUID
-// characteristicUUIDHTC("0000cb01-0000-1000-8000-00805f9b34fb"); ^ V1
-// Characteristic long UUID
-static NimBLEUUID characteristicUUIDHTC("CB01");
+static NimBLEUUID characteristicUUIDHTC("0000cb01-0000-1000-8000-00805f9b34fb");
 
 static NimBLEUUID serviceUUIDV2("00001523-1212-efde-1523-785feabcd124");
 static NimBLEUUID characteristicUUIDV2("00001525-1212-efde-1523-785feabcd124");
@@ -76,11 +120,49 @@ static NimBLEAdvertisedDevice* discoveredLighthouses[MAX_DISCOVERABLE_LH];
 
 uint8_t discoveredLighthouseVersions[MAX_DISCOVERABLE_LH];
 
+// Store the lighthouse ID index for each discovered lighthouse
+int discoveredLighthouseIds[MAX_DISCOVERABLE_LH];
+
 uint8_t currentCommand = NOTHING;
 
 int lighthouseCount = 0;
 
+int targetLighthouseIndex = -1; // -1 means all lighthouses, 0+ means specific lighthouse
+
 void scanEndedCB(NimBLEScanResults results);
+
+// MQTT function declarations
+bool connectMqtt();
+void loadMqttConfig();
+void saveMqttConfig();
+void publishMqttStatus();
+void handleMqttConfig();
+void handleMqttSave();
+
+// Function to create lighthouse command with proper structure
+void makeLighthouseCommand(uint8_t* buffer, uint8_t cmdId, uint16_t timeout, const char* uniqueId) {
+  // Clear buffer
+  memset(buffer, 0, 20);
+  
+  // Header
+  buffer[0] = 0x12;
+  
+  // Command ID (0x00 = wake, 0x02 = sleep)
+  buffer[1] = cmdId;
+  
+  // Timeout (2 bytes, big endian)
+  buffer[2] = (timeout >> 8) & 0xFF;
+  buffer[3] = timeout & 0xFF;
+  
+  // Convert unique ID from hex string to 4 bytes (little endian)
+  uint32_t id = strtoul(uniqueId, NULL, 16);
+  buffer[4] = id & 0xFF;
+  buffer[5] = (id >> 8) & 0xFF;
+  buffer[6] = (id >> 16) & 0xFF;
+  buffer[7] = (id >> 24) & 0xFF;
+  
+  // Remaining 12 bytes are already zero from memset
+}
 
 static bool readyToConnect = false;
 static uint32_t scanTime = 5; /** 0 = scan forever. In seconds */
@@ -91,481 +173,809 @@ void startScanAndSetCommand(uint8_t command) {
   for (uint8_t i = 0; i < MAX_DISCOVERABLE_LH; i++) {
     discoveredLighthouses[i] = nullptr;
     discoveredLighthouseVersions[i] = 0;
+    discoveredLighthouseIds[i] = -1;
   }
   NimBLEDevice::getScan()->start(scanTime, scanEndedCB);
   currentCommand = command;
 }
 
 void handleRoot() {
-  String html = "<!DOCTYPE html><html><head><title>Lighthouse Control</title></head>";
-  html += "<body><h1>Lighthouse Control</h1>";
-  html += "<p><a href=\"/on\"><button>Turn On</button></a></p>";
-  html += "<p><a href=\"/off\"><button>Turn Off</button></a></p>";
-  html += "</body></html>";
+  String html = "<html><head><title>Lighthouse Controller</title>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<meta charset='UTF-8'>";
+  html += "<style>";
+  html += "body { font-family: Arial, sans-serif; margin: 20px; background-color: #f5f5f5; }";
+  html += ".container { max-width: 800px; margin: 0 auto; }";
+  html += ".lighthouse { border: 1px solid #ddd; margin: 10px 0; padding: 15px; border-radius: 8px; background-color: white; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }";
+  html += ".lighthouse h3 { margin-top: 0; color: #333; border-bottom: 1px solid #eee; padding-bottom: 10px; }";
+  html += ".button { font-size: 14px; padding: 8px 15px; margin: 5px; border: none; border-radius: 4px; cursor: pointer; text-decoration: none; display: inline-block; }";
+  html += ".on-btn { background-color: #4CAF50; color: white; }";
+  html += ".off-btn { background-color: #f44336; color: white; }";
+  html += ".edit-btn { background-color: #2196F3; color: white; }";
+  html += ".save-btn { background-color: #FF9800; color: white; }";
+  html += ".on-btn:hover { background-color: #45a049; }";
+  html += ".off-btn:hover { background-color: #da190b; }";
+  html += ".edit-btn:hover { background-color: #1976D2; }";
+  html += ".save-btn:hover { background-color: #F57C00; }";
+  html += ".status { font-weight: bold; margin: 15px 0; padding: 10px; background-color: #e3f2fd; border-radius: 4px; }";
+  html += ".lighthouse-id { font-size: 12px; color: #666; margin: 5px 0; }";
+  html += ".name-input { padding: 5px; margin: 5px; border: 1px solid #ccc; border-radius: 3px; }";
+  html += ".controls { margin-top: 10px; }";
+  html += "h1 { text-align: center; color: #333; }";
+  html += ".discovery-info { text-align: center; margin: 20px 0; font-weight: bold; }";
+  html += "</style></head><body>";
+  
+  html += "<div class='container'>";
+  html += "<h1>SteamVR Lighthouse Controller</h1>";
+  
+  // Status section
+  html += "<div class='status'>Status: ";
+  if (currentCommand == NOTHING) {
+    html += "Ready";
+  } else if (currentCommand == TURN_ON_PERM) {
+    html += "Turning ON...";
+  } else if (currentCommand == TURN_OFF) {
+    html += "Turning OFF...";
+  }
+  html += "</div>";
+  
+  // All lighthouses control
+  html += "<div class='lighthouse'>";
+  html += "<h3>All Lighthouses</h3>";
+  html += "<div class='controls'>";
+  html += "<a href='/on'><button class='button on-btn'>Turn All ON</button></a>";
+  html += "<a href='/off'><button class='button off-btn'>Turn All OFF</button></a>";
+  html += "</div>";
+  html += "</div>";
+  
+  // Individual lighthouse controls
+  for (int i = 0; i < sizeof(lighthouseMappings) / sizeof(lighthouseMappings[0]); i++) {
+    html += "<div class='lighthouse'>";
+    html += "<h3>" + lighthouseNames[i] + "</h3>";
+    html += "<div class='lighthouse-id'>ID: " + String(lighthouseMappings[i].advertisedId) + "</div>";
+    
+    html += "<div class='controls'>";
+    html += "<a href='/on?id=" + String(i) + "'><button class='button on-btn'>Turn ON</button></a>";
+    html += "<a href='/off?id=" + String(i) + "'><button class='button off-btn'>Turn OFF</button></a>";
+    html += "<button class='button edit-btn' onclick='editName(" + String(i) + ")'>Rename</button>";
+    html += "</div>";
+    
+    // Hidden rename form
+    html += "<div id='rename-" + String(i) + "' style='display:none; margin-top:10px;'>";
+    html += "<input type='text' id='name-" + String(i) + "' class='name-input' value='" + lighthouseNames[i] + "' placeholder='Enter new name'>";
+    html += "<button class='button save-btn' onclick='saveName(" + String(i) + ")'>Save</button>";
+    html += "<button class='button off-btn' onclick='cancelEdit(" + String(i) + ")'>Cancel</button>";
+    html += "</div>";
+    
+    html += "</div>";
+  }
+  
+  html += "<div class='discovery-info'>Discovered Lighthouses: " + String(lighthouseCount) + "</div>";
+  
+  // MQTT status and configuration link
+  html += "<div style='text-align: center; margin: 20px 0;'>";
+  html += "<strong>MQTT Status:</strong> ";
+  if (mqttEnabled) {
+    html += "<span style='color: " + String(mqttClient.connected() ? "green" : "red") + "'>";
+    html += mqttClient.connected() ? "Connected" : "Disconnected";
+    html += "</span>";
+  } else {
+    html += "<span style='color: gray'>Disabled</span>";
+  }
+  html += " | <a href='/mqtt' class='button edit-btn'>Configure MQTT</a>";
+  html += "</div>";
+  
+  // JavaScript for rename functionality
+  html += "<script>";
+  html += "function editName(id) {";
+  html += "  document.getElementById('rename-' + id).style.display = 'block';";
+  html += "}";
+  html += "function cancelEdit(id) {";
+  html += "  document.getElementById('rename-' + id).style.display = 'none';";
+  html += "}";
+  html += "function saveName(id) {";
+  html += "  var newName = document.getElementById('name-' + id).value;";
+  html += "  if (newName.trim() !== '') {";
+  html += "    window.location.href = '/rename?id=' + id + '&name=' + encodeURIComponent(newName);";
+  html += "  }";
+  html += "}";
+  html += "</script>";
+  
+  html += "</div></body></html>";
   server.send(200, "text/html", html);
 }
 
 void handleOn() {
-  startScanAndSetCommand(TURN_ON_PERM);
-  server.send(200, "text/html", "Turning on lighthouses");
+  if (currentCommand == NOTHING) {
+    String targetId = server.arg("id");
+    if (targetId.length() > 0) {
+      // Individual lighthouse control
+      int lighthouseIndex = targetId.toInt();
+      if (lighthouseIndex >= 0 && lighthouseIndex < sizeof(lighthouseMappings) / sizeof(lighthouseMappings[0])) {
+        targetLighthouseIndex = lighthouseIndex;
+        startScanAndSetCommand(TURN_ON_PERM);
+        server.send(200, "text/html", "<html><body><h1>Turning ON Lighthouse " + String(lighthouseMappings[lighthouseIndex].advertisedId) + "...</h1><p><a href='/'>Back</a></p></body></html>");
+      } else {
+        server.send(400, "text/html", "<html><body><h1>Invalid lighthouse index</h1><p><a href='/'>Back</a></p></body></html>");
+      }
+    } else {
+      // All lighthouses control
+      targetLighthouseIndex = -1; // -1 means all lighthouses
+      startScanAndSetCommand(TURN_ON_PERM);
+      server.send(200, "text/html", "<html><body><h1>Turning ON All Lighthouses...</h1><p><a href='/'>Back</a></p></body></html>");
+    }
+  } else {
+    server.send(200, "text/html", "<html><body><h1>Command already in progress</h1><p><a href='/'>Back</a></p></body></html>");
+  }
 }
 
 void handleOff() {
-  startScanAndSetCommand(TURN_OFF);
-  server.send(200, "text/html", "Turning off lighthouses");
+  if (currentCommand == NOTHING) {
+    String targetId = server.arg("id");
+    if (targetId.length() > 0) {
+      // Individual lighthouse control
+      int lighthouseIndex = targetId.toInt();
+      if (lighthouseIndex >= 0 && lighthouseIndex < sizeof(lighthouseMappings) / sizeof(lighthouseMappings[0])) {
+        targetLighthouseIndex = lighthouseIndex;
+        startScanAndSetCommand(TURN_OFF);
+        server.send(200, "text/html", "<html><body><h1>Turning OFF Lighthouse " + String(lighthouseMappings[lighthouseIndex].advertisedId) + "...</h1><p><a href='/'>Back</a></p></body></html>");
+      } else {
+        server.send(400, "text/html", "<html><body><h1>Invalid lighthouse index</h1><p><a href='/'>Back</a></p></body></html>");
+      }
+    } else {
+      // All lighthouses control
+      targetLighthouseIndex = -1; // -1 means all lighthouses
+      startScanAndSetCommand(TURN_OFF);
+      server.send(200, "text/html", "<html><body><h1>Turning OFF All Lighthouses...</h1><p><a href='/'>Back</a></p></body></html>");
+    }
+  } else {
+    server.send(200, "text/html", "<html><body><h1>Command already in progress</h1><p><a href='/'>Back</a></p></body></html>");
+  }
+}
+
+void handleRename() {
+  String targetId = server.arg("id");
+  String newName = server.arg("name");
+  
+  if (targetId.length() > 0 && newName.length() > 0) {
+    int lighthouseIndex = targetId.toInt();
+    if (lighthouseIndex >= 0 && lighthouseIndex < sizeof(lighthouseMappings) / sizeof(lighthouseMappings[0])) {
+      // Limit name length and sanitize
+      newName = newName.substring(0, 20); // Max 20 characters
+      lighthouseNames[lighthouseIndex] = newName;
+      
+      // Redirect back to main page
+      server.sendHeader("Location", "/");
+      server.send(302, "text/plain", "");
+    } else {
+      server.send(400, "text/html", "<html><body><h1>Invalid lighthouse index</h1><p><a href='/'>Back</a></p></body></html>");
+    }
+  } else {
+    server.send(400, "text/html", "<html><body><h1>Missing parameters</h1><p><a href='/'>Back</a></p></body></html>");
+  }
+}
+
+void handleMqttConfig() {
+  String html = "<html><head><title>MQTT Configuration</title>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<style>";
+  html += "body { font-family: Arial, sans-serif; margin: 20px; background-color: #f5f5f5; }";
+  html += ".container { max-width: 600px; margin: 0 auto; background-color: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }";
+  html += ".form-group { margin-bottom: 15px; }";
+  html += "label { display: block; margin-bottom: 5px; font-weight: bold; }";
+  html += "input[type='text'], input[type='password'], input[type='number'] { width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; }";
+  html += "input[type='checkbox'] { margin-right: 8px; }";
+  html += ".button { background-color: #4CAF50; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; font-size: 16px; margin-right: 10px; }";
+  html += ".button:hover { background-color: #45a049; }";
+  html += ".back-btn { background-color: #6c757d; }";
+  html += ".back-btn:hover { background-color: #5a6268; }";
+  html += "h1 { color: #333; }";
+  html += ".status { margin: 10px 0; padding: 10px; background-color: #e3f2fd; border-radius: 4px; }";
+  html += "</style></head><body>";
+  
+  html += "<div class='container'>";
+  html += "<h1>MQTT Configuration</h1>";
+  
+  // Show current MQTT status
+  html += "<div class='status'>";
+  html += "<strong>Current Status:</strong> ";
+  if (mqttEnabled) {
+    html += mqttClient.connected() ? "Connected" : "Enabled but not connected";
+  } else {
+    html += "Disabled";
+  }
+  html += "</div>";
+  
+  html += "<form method='POST' action='/mqtt-save'>";
+  
+  html += "<div class='form-group'>";
+  html += "<label><input type='checkbox' name='enabled' " + String(mqttEnabled ? "checked" : "") + "> Enable MQTT</label>";
+  html += "</div>";
+  
+  html += "<div class='form-group'>";
+  html += "<label for='server'>MQTT Server:</label>";
+  html += "<input type='text' id='server' name='server' value='" + mqttServer + "' placeholder='192.168.1.100'>";
+  html += "</div>";
+  
+  html += "<div class='form-group'>";
+  html += "<label for='port'>Port:</label>";
+  html += "<input type='number' id='port' name='port' value='" + String(mqttPort) + "' placeholder='1883'>";
+  html += "</div>";
+  
+  html += "<div class='form-group'>";
+  html += "<label for='username'>Username:</label>";
+  html += "<input type='text' id='username' name='username' value='" + mqttUsername + "' placeholder='Optional'>";
+  html += "</div>";
+  
+  html += "<div class='form-group'>";
+  html += "<label for='password'>Password:</label>";
+  html += "<input type='password' id='password' name='password' value='" + mqttPassword + "' placeholder='Optional'>";
+  html += "</div>";
+  
+  html += "<div class='form-group'>";
+  html += "<label for='topic'>Base Topic:</label>";
+  html += "<input type='text' id='topic' name='topic' value='" + mqttTopic + "' placeholder='lighthouse'>";
+  html += "</div>";
+  
+  html += "<div style='margin-top: 20px;'>";
+  html += "<p><strong>MQTT Topics that will be used:</strong></p>";
+  html += "<ul>";
+  html += "<li><code>" + mqttTopic + "/command</code> - Send 'on' or 'off' to control all lighthouses</li>";
+  html += "<li><code>" + mqttTopic + "/lighthouse0/command</code> - Control individual lighthouse</li>";
+  html += "<li><code>" + mqttTopic + "/lighthouse1/command</code> - Control individual lighthouse</li>";
+  html += "<li><code>" + mqttTopic + "/lighthouse0/status</code> - Lighthouse status (published)</li>";
+  html += "<li><code>" + mqttTopic + "/lighthouse0/name</code> - Lighthouse name (published)</li>";
+  html += "</ul>";
+  html += "</div>";
+  
+  html += "<button type='submit' class='button'>Save Configuration</button>";
+  html += "<a href='/' class='button back-btn'>Back to Main</a>";
+  html += "</form>";
+  
+  html += "</div></body></html>";
+  
+  server.send(200, "text/html", html);
+}
+
+void handleMqttSave() {
+  mqttEnabled = server.hasArg("enabled");
+  mqttServer = server.arg("server");
+  mqttPort = server.arg("port").toInt();
+  if (mqttPort <= 0) mqttPort = 1883;
+  mqttUsername = server.arg("username");
+  mqttPassword = server.arg("password");
+  mqttTopic = server.arg("topic");
+  if (mqttTopic.length() == 0) mqttTopic = "lighthouse";
+  
+  // Save configuration
+  saveMqttConfig();
+  
+  // Disconnect existing MQTT connection if any
+  if (mqttClient.connected()) {
+    mqttClient.disconnect();
+  }
+  
+  // Try to connect with new settings
+  if (mqttEnabled) {
+    connectMqtt();
+  }
+  
+  // Redirect back to MQTT config page
+  server.sendHeader("Location", "/mqtt");
+  server.send(302, "text/plain", "");
 }
 
 class ClientCallbacks : public NimBLEClientCallbacks {
   void onConnect(NimBLEClient* pClient) {
     Serial.println("Connected");
-    /** After connection we should change the parameters if we don't need fast
-     * response times. These settings are 150ms interval, 0 latency, 450ms
-     * timout. Timeout should be a multiple of the interval, minimum is 100ms.
-     *  I find a multiple of 3-5 * the interval works best for quick
-     * response/reconnect. Min interval: 120 * 1.25ms = 150, Max interval: 120
-     * * 1.25ms = 150, 0 latency, 60 * 10ms = 600ms timeout
-     */
-    pClient->updateConnParams(120, 120, 0, 60);
-  };
+  }
 
   void onDisconnect(NimBLEClient* pClient) {
     Serial.print(pClient->getPeerAddress().toString().c_str());
-    Serial.println(" - Disconnected");
-    // NimBLEDevice::getScan()->start(scanTime, scanEndedCB);
-  };
+    Serial.println(" Disconnected - Starting scan");
+  }
 
-  /** Called when the peripheral requests a change to the connection parameters.
-   *  Return true to accept and apply them or false to reject and keep
-   *  the currently used parameters. Default will return true.
-   */
-  bool onConnParamsUpdateRequest(NimBLEClient* pClient,
-                                 const ble_gap_upd_params* params) {
-    if (params->itvl_min < 24) { /** 1.25ms units */
+  bool onConnParamsUpdateRequest(NimBLEClient* pClient, const ble_gap_upd_params* params) {
+    if (params->itvl_min < 24) {
       return false;
-    } else if (params->itvl_max > 40) { /** 1.25ms units */
+    } else if (params->itvl_max > 40) {
       return false;
-    } else if (params->latency > 2) { /** Number of intervals allowed to skip */
+    } else if (params->latency > 2) {
       return false;
-    } else if (params->supervision_timeout > 100) { /** 10ms units */
+    } else if (params->supervision_timeout > 100) {
       return false;
     }
-
     return true;
-  };
+  }
 };
 
-/** Define a class to handle the callbacks when advertisments are received */
-class AdvertisedDeviceCallbacks : public NimBLEAdvertisedDeviceCallbacks {
-  void onResult(NimBLEAdvertisedDevice* advertisedDevice) {
-    Serial.println(__LINE__);
-    Serial.print("Advertised Device found: ");
-    Serial.println(advertisedDevice->toString().c_str());
-    // V1 HTC Base Stations discovery
-    if (advertisedDevice->isAdvertisingService(serviceUUIDHTC) &&
-        advertisedDevice->haveName() &&
-        advertisedDevice->getName().substr(0, 6) == "HTC BS") {
-      char advertisedID[7];
-      strcpy(advertisedID, advertisedDevice->getName().substr(7, 6).c_str());
-
-      Serial.println("V1 Base Station Found!");
-      Serial.print("Advertised ID: ");
-      Serial.println(advertisedID);
-
-      // Have we already discovered this lighthouse?
-      for (uint8_t i = 0; i < MAX_DISCOVERABLE_LH; i++) {
-        if (discoveredLighthouses[i] == nullptr)
-          continue;
-        if (discoveredLighthouses[i]->getAddress() ==
-            advertisedDevice->getAddress()) {
-          return;
-        }
-      }
-      // Are we expecting this lighthouse?
-      bool expected = false;
-
-      for (uint8_t i = 0; i < sizeof(lighthouseHTCIDs) / sizeof(char*); i++) {
-        std::string advertisedIDchomp =
-            advertisedDevice->getName().substr(9, 4);
-        std::string registeredIDchomp = std::string(lighthouseHTCIDs[i]);
-        registeredIDchomp = registeredIDchomp.substr(4, 4);
-        if (advertisedIDchomp == registeredIDchomp) {
-          expected = true;
-        }
-      }
-
-      if (!expected) {
-        Serial.println("Ignoring this Base Station, ID doesn't match.");
-        return;
-      }
-      Serial.print("Controllable devices: ");
-      Serial.println(lighthouseCount + 1);
-      discoveredLighthouses[lighthouseCount] = advertisedDevice;
-      discoveredLighthouseVersions[lighthouseCount] = 1;
-
-      lighthouseCount++;
-      if (lighthouseCount >= MAX_DISCOVERABLE_LH ||
-          lighthouseCount >= sizeof(lighthouseHTCIDs) / sizeof(char*))
-        NimBLEDevice::getScan()->stop();
-    } else
-        // V2 Base Stations discovery
-        if (advertisedDevice->isAdvertisingService(serviceUUIDV2) &&
-            advertisedDevice->haveName() &&
-            advertisedDevice->getName().substr(0, 3) == "LHB") {
-      Serial.println("V2 Base Station Found!");
-      Serial.print("MAC Address: ");
-      Serial.println(advertisedDevice->getAddress().toString().c_str());
-
-      // Have we already discovered this lighthouse?
-      for (uint8_t i = 0; i < MAX_DISCOVERABLE_LH; i++) {
-        if (discoveredLighthouses[i] == nullptr)
-          continue;
-        if (discoveredLighthouses[i]->getAddress() ==
-            advertisedDevice->getAddress()) {
-          return;
-        }
-      }
-
-      if (lighthouseV2Filtering) {
-        // Are we expecting this lighthouse?
-        bool expected = false;
-
-        for (NimBLEAddress address : lighthouseV2MACs) {
-          if (address == advertisedDevice->getAddress()) {
-            expected = true;
-          }
-        }
-
-        if (!expected) {
-          Serial.println("Ignoring this Base Station, MAC doesn't match.");
-          return;
-        }
-      }
-
-      Serial.print("Controllable devices: ");
-      Serial.println(lighthouseCount + 1);
-      discoveredLighthouses[lighthouseCount] = advertisedDevice;
-      discoveredLighthouseVersions[lighthouseCount] = 2;
-
-      lighthouseCount++;
-      if (lighthouseCount >= MAX_DISCOVERABLE_LH ||
-          lighthouseCount >= sizeof(lighthouseHTCIDs) / sizeof(char*))
-        NimBLEDevice::getScan()->stop();
-    }
-    // Discovery Done
-  };
-};
-
-/** Callback to process the results of the last scan or restart it */
-void scanEndedCB(NimBLEScanResults results) {
-  Serial.println("Scan Ended");
-  if (lighthouseCount)
-    readyToConnect = true;
-}
-
-/** Create a single global instance of the callback class to be used by all
- * clients */
 static ClientCallbacks clientCB;
 
-bool connectToLighthouse(NimBLEClient* pClient,
-                         NimBLEAdvertisedDevice* advDevice) {
-  bool connected = false;
-  // Let's give it a few tries just in case, I've had it fail once but work
-  // again right after.
-  for (uint8_t i = 0; i < 3; i++) {
-    delay(1500);
-    Serial.print("Connection Attempt #");
-    Serial.print(i+1);
-    Serial.print(": ");
-    connected = pClient->connect(advDevice, false);
-    if (connected) {
-      Serial.println("Success");
-      break;
-    } else {
-      Serial.println("Fail");
+class AdvertisedDeviceCallbacks : public NimBLEAdvertisedDeviceCallbacks {
+  void onResult(NimBLEAdvertisedDevice* advertisedDevice) {
+    Serial.print("Advertised Device found: ");
+    Serial.println(advertisedDevice->toString().c_str());
+
+    if (lighthouseCount >= MAX_DISCOVERABLE_LH) {
+      return;
+    }
+
+    // Check for V1 (HTC) Base Stations
+    if (advertisedDevice->isAdvertisingService(serviceUUIDHTC)) {
+      String advertisedName = advertisedDevice->getName().c_str();
+      Serial.println("=== HTC Base Station Found ===");
+      Serial.printf("Advertised Name: '%s'\n", advertisedName.c_str());
+      Serial.printf("MAC Address: %s\n", advertisedDevice->getAddress().toString().c_str());
+      
+      for (int i = 0; i < sizeof(lighthouseMappings) / sizeof(lighthouseMappings[0]); i++) {
+        Serial.printf("Checking against mapping[%d]: advertised='%s', fullId='%s'\n", i, lighthouseMappings[i].advertisedId, lighthouseMappings[i].fullId);
+        if (advertisedName.indexOf(lighthouseMappings[i].advertisedId) >= 0) {
+          // Check if we're targeting a specific lighthouse
+          if (targetLighthouseIndex >= 0 && targetLighthouseIndex != i) {
+            Serial.printf("Skipping - not target lighthouse (want %d, this is %d)\n", targetLighthouseIndex, i);
+            continue; // Skip this lighthouse if we're not targeting it
+          }
+          
+          Serial.printf("✅ MATCH! Found V1 Lighthouse: %s (Full ID: %s)\n", advertisedName.c_str(), lighthouseMappings[i].fullId);
+          discoveredLighthouses[lighthouseCount] = advertisedDevice;
+          discoveredLighthouseVersions[lighthouseCount] = 1;
+          discoveredLighthouseIds[lighthouseCount] = i; // Store the mapping index
+          lighthouseCount++;
+          break;
+        }
+      }
+      Serial.println("===============================");
+    }
+    // Check for V2 Base Stations
+    else if (advertisedDevice->isAdvertisingService(serviceUUIDV2)) {
+      bool shouldAdd = true;
+      
+      if (lighthouseV2Filtering) {
+        shouldAdd = false;
+        for (int i = 0; i < sizeof(lighthouseV2MACs) / sizeof(lighthouseV2MACs[0]); i++) {
+          if (advertisedDevice->getAddress().equals(lighthouseV2MACs[i])) {
+            shouldAdd = true;
+            break;
+          }
+        }
+      }
+      
+      if (shouldAdd) {
+        Serial.printf("Found V2 Lighthouse: %s\n", advertisedDevice->getAddress().toString().c_str());
+        discoveredLighthouses[lighthouseCount] = advertisedDevice;
+        discoveredLighthouseVersions[lighthouseCount] = 2;
+        discoveredLighthouseIds[lighthouseCount] = -1; // V2 doesn't need ID index
+        lighthouseCount++;
+      }
     }
   }
-  if (connected) {
-    return true;
-  }
-  return false;
-}
+};
 
-/** Handles the provisioning of clients and connects / interfaces with the
- * server */
 bool sendLighthouseCommands() {
-  NimBLEClient* pClient = nullptr;
+  // Clean up existing clients
+  auto clientList = NimBLEDevice::getClientList();
+  for (auto client : *clientList) {
+    NimBLEDevice::deleteClient(client);
+  }
 
-  NimBLEAdvertisedDevice* advDevice = nullptr;
-
-  bool fullSuccess = true;
-
-  if (!lighthouseCount) {
-    Serial.println("No lighthouses found to send commands to");
+  if (lighthouseCount == 0) {
+    Serial.println("No lighthouses found!");
     return false;
   }
 
-  for (uint8_t i = 0; i < lighthouseCount; i++) {
-    // Serial.println(__LINE__);
-    advDevice = discoveredLighthouses[i];
+  bool success = true;
 
-    /** Check if we have a client we should reuse first **/
+  for (int i = 0; i < lighthouseCount; i++) {
+    if (discoveredLighthouses[i] == nullptr) continue;
+
+    if (NimBLEDevice::getClientListSize() >= NIMBLE_MAX_CONNECTIONS) {
+      Serial.println("Max clients reached");
+      break;
+    }
+
+    NimBLEClient* pClient = nullptr;
+
     if (NimBLEDevice::getClientListSize()) {
-      /** Special case when we already know this device, we send false as the
-       *  second argument in connect() to prevent refreshing the service
-       * database. This saves considerable time and power.
-       */
-      pClient = NimBLEDevice::getClientByPeerAddress(advDevice->getAddress());
+      pClient = NimBLEDevice::getClientByPeerAddress(discoveredLighthouses[i]->getAddress());
       if (pClient) {
-        if (connectToLighthouse(pClient, advDevice)) {
-          Serial.println("Reconnected!");
-        } else {
-          Serial.println("Reconnect failed!");
-          return false;
+        if (!pClient->connect(discoveredLighthouses[i], false)) {
+          Serial.println("Reconnect failed");
+          continue;
         }
-      }
-      /** We don't already have a client that knows this device,
-       *  we will check for a client that is disconnected that we can use.
-       */
-      else {
-        pClient = NimBLEDevice::getDisconnectedClient();
+        Serial.println("Reconnected client");
       }
     }
 
-    /** No client to reuse? Create a new one. */
     if (!pClient) {
       if (NimBLEDevice::getClientListSize() >= NIMBLE_MAX_CONNECTIONS) {
-        Serial.println("Max clients reached - no more connections available");
-        return false;
+        Serial.println("Max clients reached - Unable to create client");
+        continue;
       }
 
       pClient = NimBLEDevice::createClient();
-
       Serial.println("New client created");
 
       pClient->setClientCallbacks(&clientCB, false);
-      /** Set initial connection parameters: These settings are 15ms interval, 0
-       * latency, 120ms timout. These settings are safe for 3 clients to connect
-       * reliably, can go faster if you have less connections. Timeout should be
-       * a multiple of the interval, minimum is 100ms. Min interval: 12 * 1.25ms
-       * = 15, Max interval: 12 * 1.25ms = 15, 0 latency, 51 * 10ms = 510ms
-       * timeout
-       */
       pClient->setConnectionParams(12, 12, 0, 51);
-      /** Set how long we are willing to wait for the connection to complete
-       * (seconds), default is 30. */
-      pClient->setConnectTimeout(10);
+      pClient->setConnectTimeout(5);
 
-      if (!connectToLighthouse(pClient, advDevice)) {
-        /** Created a client but failed to connect, don't need to keep it as it
-         * has no data */
-        NimBLEDevice::deleteClient(pClient);
-        Serial.println("Failed to connect, deleted client");
-        return false;
+      // Try to connect with retry
+      bool connected = false;
+      for (int retry = 0; retry < 3; retry++) {
+        Serial.printf("Connection attempt %d/3 for %s\n", retry + 1, discoveredLighthouses[i]->getAddress().toString().c_str());
+        if (pClient->connect(discoveredLighthouses[i])) {
+          connected = true;
+          break;
+        }
+        if (retry < 2) {
+          Serial.println("Connection failed, retrying...");
+          delay(1000); // Wait 1 second before retry
+        }
       }
-    }
-
-    if (!pClient->isConnected()) {
-      if (!connectToLighthouse(pClient, advDevice)) {
-        Serial.println("Failed to connect");
-        return false;
+      
+      if (!connected) {
+        NimBLEDevice::deleteClient(pClient);
+        Serial.printf("Failed to connect after 3 attempts to %s\n", discoveredLighthouses[i]->getAddress().toString().c_str());
+        success = false;
+        continue;
       }
     }
 
     Serial.print("Connected to: ");
     Serial.println(pClient->getPeerAddress().toString().c_str());
-    Serial.print("RSSI: ");
-    Serial.println(pClient->getRssi());
 
-    /** Now we can read/write/subscribe the charateristics of the services we
-     * are interested in */
     NimBLERemoteService* pSvc = nullptr;
     NimBLERemoteCharacteristic* pChr = nullptr;
 
+    // Handle V1 (HTC) Base Stations
     if (discoveredLighthouseVersions[i] == 1) {
+      Serial.printf("Processing V1 lighthouse %d/%d\n", i + 1, lighthouseCount);
       pSvc = pClient->getService(serviceUUIDHTC);
-      if (pSvc) { /** make sure it's not null */
+      if (pSvc) {
         pChr = pSvc->getCharacteristic(characteristicUUIDHTC);
-
-        if (pChr) { /** make sure it's not null */
+        if (pChr) {
           if (pChr->canWrite()) {
-            uint8_t array[20] = {0x12, 0xCC, 0x00, 0xFF, 0xDD, 0xCC, 0xBB,
-                                 0xAA, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
-            if (currentCommand == TURN_OFF) {
-              array[1] = 0x02;
-              array[3] = 0x01;
-              std::string fullID = std::string(lighthouseHTCIDs[i]);
-              char buffer[5];
-              strcpy(buffer, fullID.substr(0, 2).c_str());
-              array[7] = strtoul(buffer, NULL, 16);
-              strcpy(buffer, fullID.substr(2, 2).c_str());
-              array[6] = strtoul(buffer, NULL, 16);
-              strcpy(buffer, fullID.substr(4, 2).c_str());
-              array[5] = strtoul(buffer, NULL, 16);
-              strcpy(buffer, fullID.substr(6, 2).c_str());
-              array[4] = strtoul(buffer, NULL, 16);
-              Serial.println(" - Turning Off");
-            } else if (currentCommand == TURN_ON_PERM) {
-              array[1] = 0x00;
-              array[3] = 0x00;
-              array[7] = 0xFF;
-              array[6] = 0xFF;
-              array[5] = 0xFF;
-              array[4] = 0xFF;
-              /*
-              std::string fullID = std::string(lighthouseHTCIDs[i]);
-              char buffer[5];
-              strcpy(buffer, fullID.substr(0, 2).c_str());
-              array[7] = strtoul(buffer, NULL, 16);
-              strcpy(buffer, fullID.substr(2, 2).c_str());
-              array[6] = strtoul(buffer, NULL, 16);
-              strcpy(buffer, fullID.substr(4, 2).c_str());
-              array[5] = strtoul(buffer, NULL, 16);
-              strcpy(buffer, fullID.substr(6, 2).c_str());
-              array[4] = strtoul(buffer, NULL, 16);
-              */
-              Serial.println(" - Turning On");
-            }
-            if (pChr->writeValue(array, 20)) {
-              Serial.println(" - Wrote command successfully");
+            // Create proper 20-byte command structure
+            uint8_t command[20];
+            int mappingIndex = discoveredLighthouseIds[i];
+            const char* lighthouseId = lighthouseMappings[mappingIndex].fullId;
+            
+            if (currentCommand == TURN_ON_PERM) {
+              // Wake command: 0x00 with no timeout
+              makeLighthouseCommand(command, 0x00, 0, lighthouseId);
+              Serial.printf("Sending WAKE command (0x00) with ID %s\n", lighthouseId);
             } else {
-              Serial.println(" - Issue with writing command!!");
-              fullSuccess = false;
+              // Sleep command: 0x02 with timeout 1
+              makeLighthouseCommand(command, 0x02, 1, lighthouseId);
+              Serial.printf("Sending SLEEP command (0x02) with ID %s\n", lighthouseId);
             }
-            // Serial.println(pChr->getHandle());
-            // Serial.printf("%d 0x%.2x", pRemoteCharacteristic->getHandle(),
-            // pRemoteCharacteristic->getHandle());
+            
+            // Debug: Print command bytes
+            Serial.print("Command bytes: ");
+            for (int j = 0; j < 20; j++) {
+              Serial.printf("%02X ", command[j]);
+            }
+            Serial.println();
+            
+            if (pChr->writeValue(command, 20)) {
+              Serial.printf("✅ Sent V1 command to %s\n", pClient->getPeerAddress().toString().c_str());
+            } else {
+              Serial.printf("❌ Failed to send V1 command to %s\n", pClient->getPeerAddress().toString().c_str());
+              success = false;
+            }
+          } else {
+            Serial.printf("❌ Characteristic not writable for %s\n", pClient->getPeerAddress().toString().c_str());
+            success = false;
           }
+        } else {
+          Serial.printf("❌ Characteristic not found for %s\n", pClient->getPeerAddress().toString().c_str());
+          success = false;
         }
       } else {
-        fullSuccess = false;
-      }
-    } else if (discoveredLighthouseVersions[i] == 2) {
-      pSvc = pClient->getService(serviceUUIDV2);
-      if (pSvc) { /** make sure it's not null */
-        pChr = pSvc->getCharacteristic(characteristicUUIDV2);
-
-        if (pChr) { /** make sure it's not null */
-          if (pChr->canWrite()) {
-            if (currentCommand == TURN_OFF) {
-              Serial.println(" - Turning Off");
-              if (pChr->writeValue(0)) {
-                Serial.println(" - Wrote command successfully");
-              } else {
-                fullSuccess = false;
-              }
-            } else if (currentCommand == TURN_ON_PERM) {
-              Serial.println(" - Turning On");
-              if (pChr->writeValue(1)) {
-                Serial.println(" - Wrote command successfully");
-              } else {
-                fullSuccess = false;
-              }
-            }
-          }
-        }
-      } else {
-        fullSuccess = false;
+        Serial.printf("❌ Service not found for %s\n", pClient->getPeerAddress().toString().c_str());
+        success = false;
       }
     }
-    Serial.println(" - Done with this device!");
-    pClient->disconnect();
+    // Handle V2 Base Stations
+    else if (discoveredLighthouseVersions[i] == 2) {
+      Serial.printf("Processing V2 lighthouse %d/%d\n", i + 1, lighthouseCount);
+      pSvc = pClient->getService(serviceUUIDV2);
+      if (pSvc) {
+        pChr = pSvc->getCharacteristic(characteristicUUIDV2);
+        if (pChr) {
+          if (pChr->canWrite()) {
+            uint8_t command = (currentCommand == TURN_ON_PERM) ? 0x01 : 0x00;
+            if (pChr->writeValue(&command, 1)) {
+              Serial.printf("✅ Sent V2 command %02X to %s\n", command, pClient->getPeerAddress().toString().c_str());
+            } else {
+              Serial.printf("❌ Failed to send V2 command to %s\n", pClient->getPeerAddress().toString().c_str());
+              success = false;
+            }
+          } else {
+            Serial.printf("❌ V2 Characteristic not writable for %s\n", pClient->getPeerAddress().toString().c_str());
+            success = false;
+          }
+        } else {
+          Serial.printf("❌ V2 Characteristic not found for %s\n", pClient->getPeerAddress().toString().c_str());
+          success = false;
+        }
+      } else {
+        Serial.printf("❌ V2 Service not found for %s\n", pClient->getPeerAddress().toString().c_str());
+        success = false;
+      }
+    }
+
+    delay(100); // Small delay between commands
   }
-  return fullSuccess;
+
+  return success;
 }
 
-// Runs once on power on
+void scanEndedCB(NimBLEScanResults results) {
+  Serial.print("Scan Ended. Found ");
+  Serial.print(lighthouseCount);
+  Serial.println(" lighthouses");
+
+  readyToConnect = true;
+}
+
+void blinkLED(int times, int delayMs) {
+  for (int i = 0; i < times; i++) {
+    digitalWrite(ledPin, HIGH);
+    delay(delayMs);
+    digitalWrite(ledPin, LOW);
+    delay(delayMs);
+  }
+}
+
+// MQTT Configuration Functions
+void loadMqttConfig() {
+  preferences.begin("lighthouse", false);
+  mqttServer = preferences.getString("mqtt_server", "");
+  mqttPort = preferences.getInt("mqtt_port", 1883);
+  mqttUsername = preferences.getString("mqtt_user", "");
+  mqttPassword = preferences.getString("mqtt_pass", "");
+  mqttTopic = preferences.getString("mqtt_topic", "lighthouse");
+  mqttEnabled = preferences.getBool("mqtt_enabled", false);
+  preferences.end();
+}
+
+void saveMqttConfig() {
+  preferences.begin("lighthouse", false);
+  preferences.putString("mqtt_server", mqttServer);
+  preferences.putInt("mqtt_port", mqttPort);
+  preferences.putString("mqtt_user", mqttUsername);
+  preferences.putString("mqtt_pass", mqttPassword);
+  preferences.putString("mqtt_topic", mqttTopic);
+  preferences.putBool("mqtt_enabled", mqttEnabled);
+  preferences.end();
+}
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String message;
+  for (int i = 0; i < length; i++) {
+    message += (char)payload[i];
+  }
+  
+  Serial.printf("MQTT message received: %s = %s\n", topic, message.c_str());
+  
+  String topicStr = String(topic);
+  
+  // Handle lighthouse commands
+  if (topicStr.endsWith("/command")) {
+    if (message == "on") {
+      startScanAndSetCommand(TURN_ON_PERM);
+    } else if (message == "off") {
+      startScanAndSetCommand(TURN_OFF);
+    }
+  }
+  // Handle individual lighthouse commands
+  else if (topicStr.indexOf("/lighthouse") > 0) {
+    // Extract lighthouse index from topic like "lighthouse/lighthouse0/command"
+    int startIdx = topicStr.indexOf("/lighthouse") + 11;
+    int endIdx = topicStr.indexOf("/", startIdx);
+    if (endIdx > startIdx) {
+      String lighthouseIndexStr = topicStr.substring(startIdx, endIdx);
+      int lighthouseIndex = lighthouseIndexStr.toInt();
+      
+      if (lighthouseIndex >= 0 && lighthouseIndex < 2) { // Only support 2 masters
+        targetLighthouseIndex = lighthouseIndex;
+        if (message == "on") {
+          startScanAndSetCommand(TURN_ON_PERM);
+        } else if (message == "off") {
+          startScanAndSetCommand(TURN_OFF);
+        }
+      }
+    }
+  }
+}
+
+bool connectMqtt() {
+  if (!mqttEnabled || mqttServer.length() == 0) {
+    return false;
+  }
+  
+  if (mqttClient.connected()) {
+    return true;
+  }
+  
+  Serial.printf("Attempting MQTT connection to %s:%d...\n", mqttServer.c_str(), mqttPort);
+  mqttClient.setServer(mqttServer.c_str(), mqttPort);
+  mqttClient.setCallback(mqttCallback);
+  
+  String clientId = "lighthouse-esp32-" + String(random(0xffff), HEX);
+  bool connected = false;
+  
+  if (mqttUsername.length() > 0 && mqttPassword.length() > 0) {
+    connected = mqttClient.connect(clientId.c_str(), mqttUsername.c_str(), mqttPassword.c_str());
+  } else {
+    connected = mqttClient.connect(clientId.c_str());
+  }
+  
+  if (connected) {
+    Serial.println("MQTT connected");
+    // Subscribe to command topics
+    String cmdTopic = mqttTopic + "/command";
+    mqttClient.subscribe(cmdTopic.c_str());
+    Serial.printf("Subscribed to: %s\n", cmdTopic.c_str());
+    
+    // Subscribe to individual lighthouse command topics
+    for (int i = 0; i < 2; i++) {
+      String individualTopic = mqttTopic + "/lighthouse" + String(i) + "/command";
+      mqttClient.subscribe(individualTopic.c_str());
+      Serial.printf("Subscribed to: %s\n", individualTopic.c_str());
+    }
+    
+    // Publish availability
+    String availTopic = mqttTopic + "/availability";
+    mqttClient.publish(availTopic.c_str(), "online", true);
+  } else {
+    Serial.printf("MQTT connection failed, rc=%d\n", mqttClient.state());
+  }
+  
+  return connected;
+}
+
+void publishMqttStatus() {
+  if (!mqttClient.connected()) return;
+  
+  // Publish lighthouse status for each discovered lighthouse
+  for (int i = 0; i < lighthouseCount && i < 2; i++) { // Only publish for 2 masters
+    String statusTopic = mqttTopic + "/lighthouse" + String(i) + "/status";
+    String nameTopic = mqttTopic + "/lighthouse" + String(i) + "/name";
+    
+    // Publish status (simplified - in real implementation you'd track actual state)
+    mqttClient.publish(statusTopic.c_str(), "unknown");
+    
+    // Publish name
+    if (discoveredLighthouseIds[i] >= 0 && discoveredLighthouseIds[i] < 2) {
+      String name = preferences.getString(("name_" + String(discoveredLighthouseIds[i])).c_str(), lighthouseNames[discoveredLighthouseIds[i]]);
+      mqttClient.publish(nameTopic.c_str(), name.c_str());
+    }
+  }
+}
+
 void setup() {
   Serial.begin(115200);
-  Serial.println("Starting NimBLE Client");
+  Serial.println("Starting SteamVR Lighthouse Controller...");
+
+  // Initialize LED pin
+  pinMode(ledPin, OUTPUT);
+  digitalWrite(ledPin, LOW);
+
+  // Initialize buttons
   offButton.begin();
   onButton.begin();
-  pinMode(ledPin, OUTPUT);
-  digitalWrite(ledPin, HIGH);
-  Serial.println("Amount of registered V1 (HTC) Lighthouses: ");
-  Serial.println(sizeof(lighthouseHTCIDs) / sizeof(char*));
-  Serial.println("Amount of registered V2.0 Lighthouses: ");
-  int v2count = 0;
-  for (NimBLEAddress address : lighthouseV2MACs) {
-    v2count++;
-  }
-  Serial.println(v2count);
-  /** Initialize NimBLE, no device name spcified as we are not advertising */
-  NimBLEDevice::init("");
 
-  /** Optional: set the transmit power, default is 3db */
+  // Initialize BLE
+  Serial.println("Initializing BLE...");
+  NimBLEDevice::init("");
   NimBLEDevice::setPower(ESP_PWR_LVL_P9); /** +9db */
 
-  /** create new scan */
   NimBLEScan* pScan = NimBLEDevice::getScan();
-
-  /** create a callback that gets called when advertisers are found */
-  pScan->setAdvertisedDeviceCallbacks(new AdvertisedDeviceCallbacks());
-
-  /** Set scan interval (how often) and window (how long) in milliseconds */
-  pScan->setInterval(45);
-  pScan->setWindow(15);
-
-  /** Active scan will gather scan response data from advertisers
-   *  but will use more energy from both devices
-   */
+  pScan->setAdvertisedDeviceCallbacks(new AdvertisedDeviceCallbacks(), false);
+  pScan->setInterval(1349);
+  pScan->setWindow(449);
   pScan->setActiveScan(true);
-  /** Start scanning for advertisers for the scan time specified (in seconds) 0
-   * = forever Optional callback for when scanning stops.
-   */
-  // pScan->start(scanTime, scanEndedCB);
 
+  // Initialize WiFi
+  Serial.println("Connecting to WiFi...");
   WiFi.begin(ssid, password);
-  Serial.print("Connecting to WiFi");
+  
   while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print('.');
+    delay(1000);
+    Serial.print(".");
   }
-  Serial.println();
-  Serial.print("Connected! IP: ");
+  
+  Serial.println("");
+  Serial.println("WiFi connected!");
+  Serial.print("IP address: ");
   Serial.println(WiFi.localIP());
 
+  // Setup web server
   server.on("/", handleRoot);
   server.on("/on", handleOn);
   server.on("/off", handleOff);
+  server.on("/rename", handleRename);
+  server.on("/mqtt", handleMqttConfig);
+  server.on("/mqtt-save", HTTP_POST, handleMqttSave);
   server.begin();
+  Serial.println("Web server started");
 
-  delay(500);
-  digitalWrite(ledPin, LOW);
+  // Load and initialize MQTT configuration
+  loadMqttConfig();
+  if (mqttEnabled) {
+    connectMqtt();
+  }
+
+  // Initial LED blink to show setup complete
+  blinkLED(3, 200);
+  
+  Serial.println("Setup complete!");
+  Serial.println("Web interface available at: http://" + WiFi.localIP().toString());
 }
 
-// This is the Arduino main loop function.
 void loop() {
   server.handleClient();
+  
+  // Handle MQTT
+  if (mqttEnabled) {
+    if (!mqttClient.connected()) {
+      unsigned long now = millis();
+      if (now - lastMqttReconnectAttempt > 5000) { // Try to reconnect every 5 seconds
+        lastMqttReconnectAttempt = now;
+        if (connectMqtt()) {
+          Serial.println("MQTT reconnected");
+        }
+      }
+    } else {
+      mqttClient.loop();
+    }
+  }
+  
+  // Handle button presses
   offButton.read();
   onButton.read();
-
-  if (offButton.wasPressed()) {
+  
+  if (offButton.wasPressed() && currentCommand == NOTHING) {
+    Serial.println("Off button pressed");
     startScanAndSetCommand(TURN_OFF);
-  } else if (onButton.wasPressed()) {
+  }
+  
+  if (onButton.wasPressed() && currentCommand == NOTHING) {
+    Serial.println("On button pressed");
     startScanAndSetCommand(TURN_ON_PERM);
   }
 
-  if (currentCommand != NOTHING && readyToConnect) {
-    Serial.println(__LINE__);
-    if (sendLighthouseCommands()) {
-      Serial.println("We should have sent the commands");
-      for (uint8_t i = 0; i < 3; i++) {
-        digitalWrite(ledPin, !digitalRead(ledPin));
-        delay(200);
+  // Handle BLE operations
+  if (readyToConnect && currentCommand != NOTHING) {
+    readyToConnect = false;
+    
+    bool success = sendLighthouseCommands();
+    
+    if (success) {
+      Serial.println("Commands sent successfully");
+      blinkLED(2, 500); // Success: 2 slow blinks
+      
+      // Publish status update via MQTT
+      if (mqttClient.connected()) {
+        publishMqttStatus();
       }
     } else {
-      Serial.println(
-          "We have failed to connect to a server that should have been there; "
-          "there is nothing more we "
-          "will do this time.");
-      for (uint8_t i = 0; i < 15; i++) {
-        digitalWrite(ledPin, !digitalRead(ledPin));
-        delay(100);
-      }
+      Serial.println("Some commands failed");
+      blinkLED(5, 100); // Error: 5 fast blinks
     }
-    digitalWrite(ledPin, LOW);
-    readyToConnect = false;
+    
     currentCommand = NOTHING;
+    targetLighthouseIndex = -1; // Reset target
+    digitalWrite(ledPin, LOW);
+    
+    // Cleanup
+    auto clientList = NimBLEDevice::getClientList();
+    for (auto client : *clientList) {
+      NimBLEDevice::deleteClient(client);
+    }
   }
+
+  delay(10);
 }
