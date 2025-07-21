@@ -14,6 +14,8 @@
 #include <Arduino.h>
 #include <NimBLEDevice.h>
 #include "JC_Button.h"
+#include <WiFi.h>
+#include <WebServer.h>
 
 // For Version 1 (HTC) Base Stations:
 
@@ -48,6 +50,11 @@ Button offButton(32);  // define the pin for button (pull to ground to activate)
 
 Button onButton(33);  // define the pin for button (pull to ground to activate)
 
+const char* ssid = "YOUR_SSID";        // TODO: set your WiFi SSID
+const char* password = "YOUR_PASSWORD"; // TODO: set your WiFi password
+
+WebServer server(80);
+
 // The remote service we wish to connect to.
 // static NimBLEUUID serviceUUIDHTC("0000cb00-0000-1000-8000-00805f9b34fb");
 // ^ V1 Service long UUID
@@ -77,6 +84,36 @@ void scanEndedCB(NimBLEScanResults results);
 
 static bool readyToConnect = false;
 static uint32_t scanTime = 5; /** 0 = scan forever. In seconds */
+
+void startScanAndSetCommand(uint8_t command) {
+  digitalWrite(ledPin, HIGH);
+  lighthouseCount = 0;
+  for (uint8_t i = 0; i < MAX_DISCOVERABLE_LH; i++) {
+    discoveredLighthouses[i] = nullptr;
+    discoveredLighthouseVersions[i] = 0;
+  }
+  NimBLEDevice::getScan()->start(scanTime, scanEndedCB);
+  currentCommand = command;
+}
+
+void handleRoot() {
+  String html = "<!DOCTYPE html><html><head><title>Lighthouse Control</title></head>";
+  html += "<body><h1>Lighthouse Control</h1>";
+  html += "<p><a href=\"/on\"><button>Turn On</button></a></p>";
+  html += "<p><a href=\"/off\"><button>Turn Off</button></a></p>";
+  html += "</body></html>";
+  server.send(200, "text/html", html);
+}
+
+void handleOn() {
+  startScanAndSetCommand(TURN_ON_PERM);
+  server.send(200, "text/html", "Turning on lighthouses");
+}
+
+void handleOff() {
+  startScanAndSetCommand(TURN_OFF);
+  server.send(200, "text/html", "Turning off lighthouses");
+}
 
 class ClientCallbacks : public NimBLEClientCallbacks {
   void onConnect(NimBLEClient* pClient) {
@@ -477,33 +514,36 @@ void setup() {
    * = forever Optional callback for when scanning stops.
    */
   // pScan->start(scanTime, scanEndedCB);
+
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print('.');
+  }
+  Serial.println();
+  Serial.print("Connected! IP: ");
+  Serial.println(WiFi.localIP());
+
+  server.on("/", handleRoot);
+  server.on("/on", handleOn);
+  server.on("/off", handleOff);
+  server.begin();
+
   delay(500);
   digitalWrite(ledPin, LOW);
 }
 
 // This is the Arduino main loop function.
 void loop() {
+  server.handleClient();
   offButton.read();
   onButton.read();
 
   if (offButton.wasPressed()) {
-    digitalWrite(ledPin, HIGH);
-    lighthouseCount = 0;
-    for (uint8_t i = 0; i < MAX_DISCOVERABLE_LH; i++) {
-      discoveredLighthouses[i] = nullptr;
-      discoveredLighthouseVersions[i] = 0;
-    }
-    NimBLEDevice::getScan()->start(scanTime, scanEndedCB);
-    currentCommand = TURN_OFF;
+    startScanAndSetCommand(TURN_OFF);
   } else if (onButton.wasPressed()) {
-    digitalWrite(ledPin, HIGH);
-    lighthouseCount = 0;
-    for (uint8_t i = 0; i < MAX_DISCOVERABLE_LH; i++) {
-      discoveredLighthouses[i] = nullptr;
-      discoveredLighthouseVersions[i] = 0;
-    }
-    NimBLEDevice::getScan()->start(scanTime, scanEndedCB);
-    currentCommand = TURN_ON_PERM;
+    startScanAndSetCommand(TURN_ON_PERM);
   }
 
   if (currentCommand != NOTHING && readyToConnect) {

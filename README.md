@@ -25,3 +25,12 @@ Connect an LED to a pin to get info on if there was an issue during the command 
 - Many fast blinks: Error, try again
 
 If you're lazy and don't want platformio, just copy the contents of main.cpp into the Arduino IDE after installing the ESP32 platform (wrote with 1.0.5) and the libraries.
+
+### Web Control
+
+The sketch now hosts a very small HTTP server so you can toggle your lighthouses from a web browser.
+
+1. Set your WiFi credentials in `src/main.cpp` (`ssid` and `password`).
+2. After the ESP32 connects to WiFi, it prints its IP address to the serial monitor.
+3. Visit `http://<that IP>/` to get a page with **Turn On** and **Turn Off** buttons.
+4. The original hardware buttons still work as before.
