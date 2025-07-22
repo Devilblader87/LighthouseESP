@@ -6,14 +6,16 @@ A wireless controller for SteamVR V1 (HTC) and V2.0 lighthouse base stations usi
 
 - **Enhanced Web Interface**: Control individual lighthouses with custom naming
 - **MQTT Integration**: Full Home Assistant automation support
+- **OTA Updates**: Wireless firmware updates with backup/restore capabilities
 - **Physical Buttons**: Hardware buttons for direct control
 - **BLE Communication**: Uses Bluetooth Low Energy with proper V1 command structure
 - **WiFi Connectivity**: Connects to your local WiFi network
 - **Individual Control**: Turn on/off specific lighthouses or all at once
-- **Custom Naming**: Rename lighthouses through web interface
+- **Custom Naming**: Rename lighthouses through web interface (persistent storage)
 - **Status LED**: Visual feedback for operations
 - **Master/Slave Support**: Control master base stations, slaves follow automatically
 - **Home Assistant Ready**: Auto-discovery and automation integration
+- **Backup System**: Download configuration backups and system information
 
 ## Hardware Requirements
 
@@ -27,8 +29,9 @@ A wireless controller for SteamVR V1 (HTC) and V2.0 lighthouse base stations usi
 - Visual Studio Code
 - PlatformIO IDE extension
 - NimBLE-Arduino library (automatically installed)
-- JC_Button library (automatically installed)
+- JC_Button library (automatically installed)  
 - PubSubClient library (automatically installed)
+- ArduinoHttpClient library (automatically installed)
 
 ## Configuration
 
@@ -53,12 +56,20 @@ const LighthouseMapping lighthouseMappings[] = {
 2. Use your original .ini file to find the full 8-character unique ID (like "3BBF1347")
 3. Map the advertised ID to the full unique ID in the configuration
 
+**Note**: Custom lighthouse names are automatically saved to flash memory and persist across restarts.
+
 ### MQTT Configuration (Optional)
 Configure MQTT through the web interface at `http://[esp32-ip]/mqtt`:
 - **MQTT Server**: Your Home Assistant IP address
 - **Port**: 1883 (default)
 - **Username/Password**: Your MQTT broker credentials
 - **Base Topic**: `lighthouse` (or customize)
+
+### OTA Updates Configuration (Optional)
+Configure OTA updates through the web interface at `http://[esp32-ip]/ota`:
+- **OTA Password**: Secure password for wireless updates
+- **Enable OTA**: Toggle OTA functionality on/off
+- **Update URL**: Optional URL for automatic firmware updates
 
 ## Building and Flashing
 
@@ -93,6 +104,23 @@ pio device monitor
    - **Individual Control**: Turn specific lighthouses on/off
    - **Rename Function**: Click "Rename" to give lighthouses custom names
    - **MQTT Configuration**: Access via `/mqtt` endpoint
+   - **OTA/Firmware Management**: Access via `/ota` endpoint
+
+**Custom Names**: When you rename a lighthouse, the new name is automatically saved to flash memory and will persist across power cycles and firmware updates.
+
+### OTA (Over-The-Air) Updates
+**Arduino IDE Method (Recommended):**
+1. After first flash, the ESP32 appears as a network device in Arduino IDE
+2. Go to Tools > Port and select "lighthouse-controller at [IP]"
+3. Upload new firmware wirelessly using your OTA password
+
+**Web Interface Method:**
+1. Go to `http://[esp32-ip]/ota`
+2. Configure OTA settings and password
+3. Use "Download Backup" to save current configuration
+4. Upload firmware or use URL-based updates
+
+**Security**: OTA is password-protected and can be disabled if not needed.
 
 ### Physical Controls
 - Connect a button between pin 32 and ground for OFF control
@@ -183,6 +211,15 @@ This controller is designed for dual-room VR setups where you have:
 - Ensure the lighthouse is not already controlled by SteamVR
 - Try the working Python tool to verify the IDs are correct
 
+### OTA Update Issues
+- Ensure ESP32 and computer are on the same network
+- Check that OTA is enabled in the web interface (`/ota`)
+- Verify the OTA password is correct
+- If Arduino IDE doesn't show the network device, restart the ESP32
+- Use serial monitor to see OTA connection logs
+- Download a backup before attempting updates
+- If OTA fails, you can always use USB to recover
+
 ## Technical Details
 
 ### Pin Configuration
@@ -206,12 +243,31 @@ This controller is designed for dual-room VR setups where you have:
 ### Web Endpoints
 - `/` - Main control interface
 - `/on` - Turn all lighthouses on
-- `/off` - Turn all lighthouses off
+- `/off` - Turn all lighthouses off  
 - `/on?id=0` - Turn specific lighthouse on
 - `/off?id=0` - Turn specific lighthouse off
 - `/rename?id=0&name=NewName` - Rename lighthouse
 - `/mqtt` - MQTT configuration interface
 - `/mqtt-save` - Save MQTT settings
+- `/ota` - OTA/Firmware configuration interface
+- `/ota-save` - Save OTA settings
+- `/firmware-update` - Trigger firmware update from URL
+- `/backup-download` - Download configuration backup
+
+### Persistent Storage
+The ESP32 uses the built-in Preferences library to store configuration in flash memory:
+- **MQTT Settings**: Server, port, credentials, topic, enabled status
+- **Lighthouse Names**: Custom names for each lighthouse (up to 30 characters)
+- **OTA Settings**: Password, enabled status, update URL
+- **Storage Location**: ESP32 NVS (Non-Volatile Storage)
+- **Persistence**: Survives power cycles, firmware updates, and factory resets
+
+### OTA Update Security
+- **Password Protected**: All OTA updates require authentication
+- **Optional**: OTA can be completely disabled for security
+- **Network Discovery**: Device appears as "lighthouse-controller" on network
+- **Backup System**: Download configuration backup before updates
+- **Safe Updates**: Failed updates don't brick the device (ESP32 dual partition system)
 
 ## Voice Control Examples
 
